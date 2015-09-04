@@ -4,6 +4,7 @@
 #include <cassert>
 #include <algorithm>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <omp.h>
 // #include <mpi.h>
@@ -20,6 +21,7 @@ struct Profile{
 		PREDICT,
 		CORRECT,
 		SORT,
+		SCAN,
 		SET_JP,
 		IO,
 		// don't touch the below
@@ -30,6 +32,8 @@ struct Profile{
 	void flush(){}
 	void beg(const int elem, const bool reuse = false){}
 	void end(const int elem){}
+	void beg_master(const int elem, const bool reuse = false){}
+	void end_master(const int elem){}
 	void show(
 			FILE *fp = stderr,
 			const char *fmt = " %s : %e\n")
@@ -57,6 +61,7 @@ struct Profile{
 		PREDICT,
 		CORRECT,
 		SORT,
+		SCAN,
 		SET_JP,
 		IO,
 		// don't touch the below
@@ -72,6 +77,7 @@ struct Profile{
 			"predict ",
 			"correct ",
 			"sort    ",
+			"scan    ",
 			"set_jp  ",
 			"I/O     ",
 			"total   ",
@@ -91,12 +97,27 @@ struct Profile{
 	}
 	void beg(const int elem, const bool reuse = false){
 		if(reuse) time[elem] -= tprev;
-		else      time[elem] -= wtime();
+		else      time[elem] -= (tprev=wtime());
 	}
 	void end(const int elem){
 		// time[elem] += wtime();
 		tprev = wtime();
 		time[elem] += tprev;
+	}
+	void beg_master(const int elem, const bool reuse = false){
+#pragma omp master
+		{
+			if(reuse) time[elem] -= tprev;
+			else      time[elem] -= (tprev=wtime());
+		}
+	}
+	void end_master(const int elem){
+#pragma omp master
+		{
+			// time[elem] += wtime();
+			tprev = wtime();
+			time[elem] += tprev;
+		}
 	}
 	void show(
 			const long nbody,
@@ -134,16 +155,31 @@ struct Profile{
 		fprintf(stdout, "prediction bandwidth = %f GB/s\n",
 				bandwidth * 1.e-9);
 #endif
+		fflush(fp);
+		fflush(stdout);
 	}
 
 	static double wtime(){
 #ifdef __HPC_ACE__
-#  if 1
+#  if 0
 		return 1.e-6 * __gettod();
 #  else
+		static bool initcall = true;
+		static double inv_cpu_clock = 0.0;
+		if(initcall){
+			initcall = false;
+			unsigned long x0, x1;
+			double t0 = omp_get_wtime();
+			asm volatile ("rd %%tick, %0" : "=r" (x0));
+			sleep(1);
+			asm volatile ("rd %%tick, %0" : "=r" (x1));
+			double t1 = omp_get_wtime();
+			inv_cpu_clock = (t1-t0) / (x1-x0);
+			printf("HPC_ACE at %e Hz\n", 1.0 / inv_cpu_clock);
+		}
 		unsigned long x;
 		asm volatile ("rd %%tick, %0" : "=r" (x));
-		return (1.0/2.0e9) * (double)x;
+		return (1.0e-6 / 1650) * (double)x;
 #  endif
 #else
 # if 0
@@ -461,9 +497,13 @@ struct NbodySystem{
 			dt *= 0.5;
 		}
 #endif
+		// for next count_nact
+		for(int i=0; i<nact; i++){
+			dtbuf[i] = ptcl[i].dt + ptcl[i].tlast;
+		}
 	}
 	__attribute__((noinline))
-	void sort_ptcl_dtcache(const int nact, const double dtlim){
+	void sort_ptcl_dtcache(const int nact, const double dtlim, const bool do_set_jp = false){
 		int beg = 0;
 		int end = nact;
 		union{ double d; long l; } m64;
@@ -491,15 +531,26 @@ struct NbodySystem{
 				const VParticle pj(&ptcl[j]);
 				pi.store(&ptcl[j]);
 				pj.store(&ptcl[i]);
+#elif defined HPC_ACE_GRAVITY
+				swap(ptcl[i], ptcl[j]);
 #else
 				std::swap(ptcl[i], ptcl[j]);
 #endif
+				if(do_set_jp){
+					gravity->set_jp(i, ptcl[i]);
+					gravity->set_jp(j, ptcl[j]);
+				}
+
 				++i;
 			}
 breakpoint:
 			end = i;
 			// printf("done : %lx\n", dtl);
 			dtl -= 1L << 52;
+		}
+		// for next count_nact
+		for(int i=0; i<nact; i++){
+			dtbuf[i] = ptcl[i].dt + ptcl[i].tlast;
 		}
 	}
 
@@ -541,6 +592,17 @@ breakpoint:
 			const double Gflops = (((1.0e-9 * nbody) * nbody) * Particle::flops) / (t1-t0);
 			printf("## Init N square : %f Gflops\n", Gflops);
 		}
+#if 0
+		for(int i=n-10; i<n; i++){
+			dvec3 acc = force[i].acc;
+			dvec3 jrk = force[i].jrk;
+			printf("%d : (%e, %e, %e) (%e, %e, %e)\n", 
+					i, 
+					acc.x, acc.y, acc.z,
+					jrk.x, jrk.y, jrk.z);
+		}
+		exit(0);
+#endif
 		for(int i=0; i<n; i++){
 			ptcl[i].assign_force(force[i]);
 			ptcl[i].init_dt(eta_s, dtmax);
@@ -599,19 +661,41 @@ breakpoint:
 	}
 
 	int count_nact(const double tnext) const {
+#if 1
 		int nact;
 		for(nact = 0; nact<nbody; nact++){
+#if 0
 			const Particle &p = ptcl[nact];
 			if(p.dt + p.tlast != tnext) break;
+#else
+			if(dtbuf[nact] != tnext) break;
+#endif
 		}
 		return nact;
+#else
+		int nact = 0;
+		int skip = 64;
+		for(;;){
+			if(nact == nbody) return nact;
+			if(nact < nbody && dtbuf[nact+skip] == tnext){
+				nact += skip;
+				continue;
+			}else{
+				if(1 == skip) return nact+1;
+				skip /= 4;
+				continue;
+			}
+		}
+#endif
 	}
 
 	__attribute__((noinline))
 	void integrate_one_block(){
+		prof.beg(Profile::SCAN, true);
 		const double tnext = ptcl[0].tlast + ptcl[0].dt;
 		const double dtlim = calc_dtlim(tnext);
 		const int    nact  = count_nact(tnext);
+		prof.end(Profile::SCAN);
 #if 0
 		printf("t = %f, nact = %6d, dtlim = %A\n", tsys, nact, dtlim);
 #endif
@@ -623,6 +707,7 @@ breakpoint:
 		gravity->calc_force_on_first_nact(nact, eps2, force);
 	  prof.end(Profile::FORCE);
 
+#if 0
 	  prof.beg(Profile::CORRECT);
 #pragma omp parallel for
 		for(int i=0; i<nact; i++){
@@ -646,6 +731,32 @@ breakpoint:
 			gravity->set_jp(i, ptcl[i]);
 		}
 	  prof.end(Profile::SET_JP);
+#else
+#pragma omp parallel
+	  {
+#pragma omp master
+		  prof.beg(Profile::CORRECT);
+#pragma omp for
+		  for(int i=0; i<nact; i++){
+			  ptcl[i].correct(force[i], eta, etapow, dtlim);
+			  dtbuf[i] = ptcl[i].dt;
+		  }
+#pragma omp master
+		  {
+			  prof.end(Profile::CORRECT);
+			  prof.beg(Profile::SORT, true);
+			  sort_ptcl_dtcache(nact, dtlim);
+			  prof.end(Profile::SORT);
+			  prof.beg(Profile::SET_JP, true);
+		  }
+#pragma omp barrier
+#pragma omp for nowait
+		  for(int i=0; i<nact; i++){
+			  gravity->set_jp(i, ptcl[i]);
+		  }
+	  } // end omp parallel
+	  prof.end(Profile::SET_JP);
+#endif
 
 		num_step += nact;
 		num_bstep++;
@@ -653,11 +764,152 @@ breakpoint:
 		tsys = tnext;
 	}
 
+#ifdef FAST_OMP_SYNC
+	void integrate_one_dtmax_fast_omp(){
+		const double tt = tsys + dtmax;
+		double sh_tnext = dtbuf[0];
+		double sh_dtlim = calc_dtlim(sh_tnext);
+		int    sh_nact  = count_nact(sh_tnext);
+#     pragma omp parallel
+		{
+			double tsys_loc = this->tsys;
+			while(tsys_loc < tt){
+				prof.beg_master(Profile::SCAN, true);
+				// const double tnext = ptcl[0].tlast + ptcl[0].dt;
+#if 0
+				const double tnext = dtbuf[0];
+				const double dtlim = calc_dtlim(tnext);
+				const int    nact  = count_nact(tnext);
+#else
+				const double tnext = sh_tnext;
+				const double dtlim = sh_dtlim;
+				const int    nact  = sh_nact;
+#endif
+				prof.end_master(Profile::SCAN);
+
+				prof.beg_master(Profile::PREDICT, true);
+// #             pragma omp barrier
+				gravity->predict_all_fast_omp(tnext);
+				prof.end_master(Profile::PREDICT);
+				prof.beg_master(Profile::FORCE, true);
+#             pragma omp barrier
+				gravity->calc_force_on_first_nact_fast_omp(nact, eps2, force);
+				prof.end_master(Profile::FORCE);
+// #             pragma omp barrier
+#if 0
+				prof.beg_master(Profile::CORRECT, true);
+				if(nact > Gravity::NACT_PARALLEL_THRESH){
+#                 pragma omp for
+					for(int i=0; i<nact; i++){
+						ptcl[i].correct(force[i], eta, etapow, dtlim);
+						dtbuf[i] = ptcl[i].dt;
+					}
+				}else{
+#                 pragma omp master
+					for(int i=0; i<nact; i++){
+						ptcl[i].correct(force[i], eta, etapow, dtlim);
+						dtbuf[i] = ptcl[i].dt;
+					}
+				}
+				prof.end_master(Profile::CORRECT);
+				prof.beg_master(Profile::SORT, true);
+#             pragma omp master
+				{
+					sort_ptcl_dtcache(nact, dtlim);
+					this->num_step += nact;
+					this->num_bstep++;
+				}
+#             pragma omp barrier
+				prof.end_master(Profile::SORT);
+				prof.beg_master(Profile::SET_JP, true);
+				if(nact > Gravity::NACT_PARALLEL_THRESH){
+#                 pragma omp for nowait
+					for(int i=0; i<nact; i++){
+						gravity->set_jp(i, ptcl[i]);
+					}
+				}else{
+#                 pragma omp master
+					for(int i=0; i<nact; i++){
+						gravity->set_jp(i, ptcl[i]);
+					}
+				}
+				prof.end_master(Profile::SET_JP);
+#else
+				if(nact > Gravity::NACT_PARALLEL_THRESH){
+					prof.beg_master(Profile::CORRECT, true);
+#                 pragma omp for
+					for(int i=0; i<nact; i++){
+						ptcl[i].correct(force[i], eta, etapow, dtlim);
+						dtbuf[i] = ptcl[i].dt;
+						// set_jp here, updated later when swap(i,j) is called
+						gravity->set_jp(i, ptcl[i]);
+					}
+					prof.end_master(Profile::CORRECT);
+#                 pragma omp master
+					{
+						prof.beg(Profile::SORT, true);
+						// sort_ptcl_dtcache(nact, dtlim);
+						sort_ptcl_dtcache(nact, dtlim, true);
+						this->num_step += nact;
+						this->num_bstep++;
+
+						sh_tnext = dtbuf[0];
+						sh_dtlim = calc_dtlim(sh_tnext);
+						sh_nact  = count_nact(sh_tnext);
+						prof.end(Profile::SORT);
+					}
+#if 0
+#                 pragma omp barrier
+					prof.beg_master(Profile::SET_JP, true);
+#                 pragma omp for nowait
+					for(int i=0; i<nact; i++){
+						gravity->set_jp(i, ptcl[i]);
+					}
+					prof.end_master(Profile::SET_JP);
+#endif
+				}else{
+#                 pragma omp master
+					{
+						prof.beg(Profile::CORRECT, true);
+						for(int i=0; i<nact; i++){
+							ptcl[i].correct(force[i], eta, etapow, dtlim);
+							dtbuf[i] = ptcl[i].dt;
+						}
+						prof.end(Profile::CORRECT);
+						prof.beg(Profile::SORT, true);
+						sort_ptcl_dtcache(nact, dtlim);
+						this->num_step += nact;
+						this->num_bstep++;
+
+						sh_tnext = dtbuf[0];
+						sh_dtlim = calc_dtlim(sh_tnext);
+						sh_nact  = count_nact(sh_tnext);
+						prof.end(Profile::SORT);
+						prof.beg(Profile::SET_JP, true);
+						for(int i=0; i<nact; i++){
+							gravity->set_jp(i, ptcl[i]);
+						}
+						prof.end(Profile::SET_JP);
+					} // end master
+				} // end if(nac > ...)
+#             pragma omp barrier
+#endif
+				tsys_loc = tnext;
+			} // while (tsys_loc < tt)
+		} // end omp parallel
+		tsys = tt;
+	}
+#endif
+
 	void integrate_one_dtmax(){
 		const double tt = tsys + dtmax;
+#if !defined FAST_OMP_SYNC
 		while(tsys < tt){
 			integrate_one_block();
 		}
+#else
+		integrate_one_dtmax_fast_omp();
+#endif
 		assert(tsys == tt);
 	}
 
@@ -668,7 +920,7 @@ breakpoint:
 	void integrate(const double tcrit){
 		prof.flush();
 		prof.beg(Profile::TOTAL);
-        while(tsys < tcrit){
+		while(tsys < tcrit){
 			double t0 = Profile::wtime();
 			integrate_one_dtmax();
 			double t1 = Profile::wtime();
@@ -708,6 +960,7 @@ breakpoint:
                 nact_avr, 
                 de_loc, de_glo, 
                 wtime, Gflops);
+		fflush(fp);
 		prof.end(Profile::IO);
 #endif 
 		prev_energy = energy;
